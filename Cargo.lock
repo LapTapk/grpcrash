@@ -445,6 +445,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libafl",
+ "once_cell",
  "prost",
  "prost-reflect",
  "serde",

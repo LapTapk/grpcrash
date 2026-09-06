@@ -1,7 +1,23 @@
-mod dump;
+mod poor;
 
-use prost_reflect::{DynamicMessage, MethodDescriptor, ReflectMessage};
+use once_cell::sync::OnceCell;
+use poor::*;
+use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor, ReflectMessage};
 
+fn get_method_by_full_name(
+    full_name: &str,
+    pool: &DescriptorPool,
+) -> Option<prost_reflect::MethodDescriptor> {
+    let (service_name, method_name) = full_name.rsplit_once('.')?;
+
+    let service = pool.get_service_by_name(service_name)?;
+
+    service
+        .methods()
+        .find(|method| method.name() == method_name)
+}
+
+// TODO: get rid of this struct
 #[derive(Copy, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct StreamId(usize);
 
@@ -23,6 +39,12 @@ impl Into<usize> for StreamId {
     }
 }
 
+impl StreamId {
+    fn from_poor(ps_id: &PStreamId) -> Self {
+        Self(ps_id.0)
+    }
+}
+
 struct CSUnary(MethodDescriptor);
 
 impl CSUnary {
@@ -32,6 +54,10 @@ impl CSUnary {
             "ClientStream can only contain method with client streaming"
         );
         Self(md)
+    }
+    fn from_poor(pcsu: &PCSUnary, proto: &DescriptorPool) -> Self {
+        let name = &pcsu.0;
+        Self(get_method_by_full_name(name, proto).expect(&format!("No method named {}", name)))
     }
 }
 
@@ -44,6 +70,11 @@ impl CStream {
             "ClientStream can only contain method with client streaming"
         );
         Self(md)
+    }
+
+    fn from_poor(pcs: &PCStream, proto: &DescriptorPool) -> Self {
+        let name = &pcs.0;
+        Self(get_method_by_full_name(name, proto).expect(&format!("No method named {}", name)))
     }
 }
 
@@ -62,11 +93,29 @@ impl SStream {
 
         Self { md, payload }
     }
+
+    fn from_poor(pss: &PSStream, proto: &DescriptorPool) -> Self {
+        let name = &pss.md;
+        let md = get_method_by_full_name(name, proto).expect(&format!("No method named {}", name));
+        let payload =
+            DynamicMessage::decode(md.input(), pss.payload.as_slice()).expect("Invalid PSStream");
+
+        Self { md, payload }
+    }
 }
 
 enum Stream {
     Client(CStream),
     Server(SStream),
+}
+
+impl Stream {
+    fn from_poor(ps: &PStream, proto: &DescriptorPool) -> Self {
+        match ps {
+            PStream::Client(pcs) => Self::Client(CStream::from_poor(pcs, proto)),
+            PStream::Server(pss) => Self::Server(SStream::from_poor(pss, proto)),
+        }
+    }
 }
 
 impl Stream {
@@ -85,8 +134,24 @@ impl Into<Action> for Stream {
 }
 
 enum StreamAction {
+    // TODO: Remove Stream prefix
     StreamStart(Stream),
     StreamEnd(StreamId),
+}
+
+impl StreamAction {
+    fn from_poor(psa: &PStreamAction, proto: &DescriptorPool) -> Self {
+        match psa {
+            PStreamAction::StreamStart(ps) => Self::StreamStart(Stream::from_poor(ps, proto)),
+            PStreamAction::StreamEnd(ps_id) => Self::StreamEnd(StreamId::from_poor(ps_id)),
+        }
+    }
+}
+
+impl Into<Action> for StreamAction {
+    fn into(self) -> Action {
+        Action::Stream(self)
+    }
 }
 
 struct StreamMessage {
@@ -109,10 +174,39 @@ impl Into<Action> for Message {
     }
 }
 
+impl Message {
+    fn from_poor(pm: &PMessage, proto: &DescriptorPool) -> Self {
+        let (con, md) = match &pm.con {
+            PMessageConnection::Stream(ps_id, pcs) => (
+                MessageConnection::Stream(StreamId::from_poor(ps_id)),
+                CStream::from_poor(pcs, proto).0,
+            ),
+            PMessageConnection::Unary(pcsu) => (
+                MessageConnection::Unary(CSUnary::from_poor(pcsu, proto)),
+                CSUnary::from_poor(pcsu, proto).0,
+            ),
+        };
+        let payload =
+            DynamicMessage::decode(md.input(), pm.payload.as_slice()).expect("Incorrect PMessage");
+
+        Self { con, payload }
+    }
+}
+
 enum Action {
     Stream(StreamAction),
     Message(Message),
     Delay(u64),
+}
+
+impl Action {
+    fn from_poor(pa: &PAction, proto: &DescriptorPool) -> Self {
+        match pa {
+            PAction::Stream(ps) => StreamAction::from_poor(ps, proto).into(),
+            PAction::Message(pm) => Message::from_poor(pm, proto).into(),
+            PAction::Delay(del) => Self::Delay(*del),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Copy)]
@@ -202,18 +296,22 @@ impl<'a> StreamList<'a> {
     }
 }
 
-struct GrpcInput(Vec<Action>);
+struct Actions(Vec<Action>);
 
-impl GrpcInput {
+impl Actions {
+    fn from_poor(poor: &[PAction], proto: &DescriptorPool) -> Self {
+        Actions(poor.iter().map(|p| Action::from_poor(p, proto)).collect())
+    }
+
     fn len(&self) -> usize {
         self.0.len()
     }
 
-    fn actions(&self) -> &Vec<Action> {
+    fn get(&self) -> &Vec<Action> {
         &self.0
     }
 
-    fn actions_mut(&mut self) -> &mut Vec<Action> {
+    fn get_mut(&mut self) -> &mut Vec<Action> {
         &mut self.0
     }
 
@@ -223,7 +321,7 @@ impl GrpcInput {
         debug_assert!(start < end, "start {} >= end {}", start, end);
 
         let mut cnt = 0;
-        for (i, a) in self.actions_mut().iter_mut().enumerate() {
+        for (i, a) in self.get_mut().iter_mut().enumerate() {
             if i <= start && matches!(a, Action::Stream(StreamAction::StreamStart(_))) {
                 cnt += 1
             }
@@ -240,7 +338,7 @@ impl GrpcInput {
 
         let end_action: Action = StreamId::from(cnt).into();
 
-        let actions = self.actions_mut();
+        let actions = self.get_mut();
         actions.reserve(2);
         actions.insert(end, end_action);
         actions.insert(start, start_action);
@@ -270,12 +368,30 @@ impl GrpcInput {
             con: MessageConnection::Unary(md),
             payload,
         };
-        self.actions_mut().insert(i, message.into());
+        self.get_mut().insert(i, message.into());
     }
 
     fn stream_list(&mut self) -> StreamList {
-        StreamList::new(self.actions_mut())
+        StreamList::new(self.get_mut())
     }
 }
 
-//impl Input for GrpcInput {}
+#[derive(serde::Deserialize)]
+struct GrpcInput {
+    #[serde(skip)]
+    rich: OnceCell<Actions>,
+
+    poor: Vec<PAction>,
+}
+
+impl GrpcInput {
+    fn rich(&self, proto: &DescriptorPool) -> &Actions {
+        self.rich
+            .get_or_init(|| Actions::from_poor(self.poor.as_slice(), proto))
+    }
+
+    fn rich_mut(&mut self, proto: &DescriptorPool) -> &mut Actions {
+        let _ = self.rich(proto);
+        self.rich.get_mut().unwrap()
+    }
+}

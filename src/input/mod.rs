@@ -318,14 +318,21 @@ impl<'a> StreamListMut<'a> {
         let s_id_idx: usize = s_id.into();
         let si = self.streams[s_id_idx];
 
-        debug_assert!(si.s >= i);
-        debug_assert!(si.e < i);
+        debug_assert!(si.s < i);
+        debug_assert!(si.e >= i);
 
         let message = Message {
             con: MessageConnection::Stream(s_id),
             payload,
         };
         self.actions.insert(i, message.into());
+    }
+}
+
+fn inc_s_id(s_id: &mut StreamId, cnt: usize) {
+    let s_id_usize: usize = (*s_id).into();
+    if s_id_usize >= cnt {
+        *s_id = StreamId::from(s_id_usize + 1)
     }
 }
 
@@ -358,19 +365,20 @@ impl Actions {
         debug_assert!(end < self.len(), "end {} >= len {}", end, self.len());
         debug_assert!(start < end, "start {} >= end {}", start, end);
 
-        let mut cnt = 0;
-        for (i, a) in self.get_mut().iter_mut().enumerate() {
-            if i <= start && matches!(a, Action::Stream(StreamAction::StreamStart(_))) {
-                cnt += 1
-            }
+        let cnt = self
+            .get()
+            .iter()
+            .take(start)
+            .filter(|action| matches!(action, Action::Stream(StreamAction::StreamStart(_))))
+            .count();
 
-            if i > start
-                && let Action::Stream(StreamAction::StreamEnd(s_id)) = a
+        for a in self.get_mut().iter_mut().skip(start) {
+            if let Action::Stream(StreamAction::StreamEnd(s_id)) = a {
+                inc_s_id(s_id, cnt);
+            } else if let Action::Message(m) = a
+                && let MessageConnection::Stream(s_id) = &mut m.con
             {
-                let s_id_usize: usize = (*s_id).into();
-                if s_id_usize >= cnt {
-                    *s_id = StreamId::from(s_id_usize + 1)
-                }
+                inc_s_id(s_id, cnt);
             }
         }
 

@@ -1,8 +1,10 @@
 mod poor;
 
+use libafl::inputs::Input;
 use once_cell::sync::OnceCell;
 use poor::*;
 use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor, ReflectMessage};
+use std::hash::{Hash, Hasher};
 
 fn get_method_by_full_name(
     full_name: &str,
@@ -45,6 +47,7 @@ impl StreamId {
     }
 }
 
+#[derive(Debug, Clone)]
 struct CSUnary(MethodDescriptor);
 
 impl CSUnary {
@@ -61,6 +64,7 @@ impl CSUnary {
     }
 }
 
+#[derive(Debug, Clone)]
 struct CStream(MethodDescriptor);
 
 impl CStream {
@@ -78,6 +82,7 @@ impl CStream {
     }
 }
 
+#[derive(Debug, Clone)]
 struct SStream {
     md: MethodDescriptor,
     payload: DynamicMessage,
@@ -104,6 +109,7 @@ impl SStream {
     }
 }
 
+#[derive(Debug, Clone)]
 enum Stream {
     Client(CStream),
     Server(SStream),
@@ -133,6 +139,7 @@ impl Into<Action> for Stream {
     }
 }
 
+#[derive(Debug, Clone)]
 enum StreamAction {
     // TODO: Remove Stream prefix
     StreamStart(Stream),
@@ -154,15 +161,18 @@ impl Into<Action> for StreamAction {
     }
 }
 
+#[derive(Debug, Clone)]
 struct StreamMessage {
     stream_id: StreamId,
 }
 
+#[derive(Debug, Clone)]
 enum MessageConnection {
     Stream(StreamId),
     Unary(CSUnary),
 }
 
+#[derive(Debug, Clone)]
 struct Message {
     con: MessageConnection,
     payload: DynamicMessage,
@@ -193,6 +203,7 @@ impl Message {
     }
 }
 
+#[derive(Debug, Clone)]
 enum Action {
     Stream(StreamAction),
     Message(Message),
@@ -224,40 +235,44 @@ impl StreamInterval {
     }
 }
 
+#[derive(Debug, Clone)]
 struct StreamList<'a> {
     streams: Vec<StreamInterval>,
-    actions: &'a mut Vec<Action>,
+    actions: &'a Vec<Action>,
+}
+
+fn get_streams(actions: &Vec<Action>) -> Vec<StreamInterval> {
+    let mut stream_starts: Vec<usize> = Vec::new();
+    let mut stream_ends: Vec<Option<usize>> = Vec::new();
+
+    for (i, a) in actions.iter().enumerate() {
+        match a {
+            Action::Stream(StreamAction::StreamStart(_)) => {
+                stream_starts.push(i);
+            }
+            Action::Stream(StreamAction::StreamEnd(s_id)) => {
+                stream_ends.resize_with(stream_starts.len(), || None);
+                let s_id_usize: usize = (*s_id).into();
+                let old_end = stream_ends[s_id_usize].replace(i);
+                debug_assert_eq!(old_end, None);
+            }
+            _ => {}
+        }
+    }
+
+    stream_starts
+        .into_iter()
+        .zip(stream_ends)
+        .map(|(s, e)| StreamInterval {
+            s,
+            e: e.expect("Not all streams have an end. GrpcInput is broken"),
+        })
+        .collect()
 }
 
 impl<'a> StreamList<'a> {
-    fn new(actions: &'a mut Vec<Action>) -> Self {
-        let mut stream_starts: Vec<usize> = Vec::new();
-        let mut stream_ends: Vec<Option<usize>> = Vec::new();
-
-        for (i, a) in actions.iter().enumerate() {
-            match a {
-                Action::Stream(StreamAction::StreamStart(_)) => {
-                    stream_starts.push(i);
-                }
-                Action::Stream(StreamAction::StreamEnd(s_id)) => {
-                    stream_ends.resize_with(stream_starts.len(), || None);
-                    let s_id_usize: usize = (*s_id).into();
-                    let old_end = stream_ends[s_id_usize].replace(i);
-                    debug_assert_eq!(old_end, None);
-                }
-                _ => {}
-            }
-        }
-
-        let streams: Vec<StreamInterval> = stream_starts
-            .into_iter()
-            .zip(stream_ends)
-            .map(|(s, e)| StreamInterval {
-                s,
-                e: e.expect("Not all streams have an end. GrpcInput is broken"),
-            })
-            .collect();
-
+    fn new(actions: &'a Vec<Action>) -> Self {
+        let streams = get_streams(actions);
         Self { actions, streams }
     }
 
@@ -275,9 +290,27 @@ impl<'a> StreamList<'a> {
             .map(|(s_id, _)| s_id.into())
             .collect()
     }
+}
+
+#[derive(Debug)]
+struct StreamListMut<'a> {
+    streams: Vec<StreamInterval>,
+    actions: &'a mut Vec<Action>,
+}
+
+impl<'a> StreamListMut<'a> {
+    fn new(actions: &'a mut Vec<Action>) -> Self {
+        let streams = get_streams(actions);
+        Self { actions, streams }
+    }
+
+    fn immut(&self) -> StreamList {
+        StreamList::new(self.actions)
+    }
 
     fn message(self, s_id: StreamId, payload: DynamicMessage, i: usize) {
-        let stream = &self.stream(s_id);
+        let immut = &self.immut();
+        let stream = immut.stream(s_id);
 
         debug_assert!(matches!(stream, Stream::Client(_)));
         debug_assert_eq!(stream.method().input(), payload.descriptor());
@@ -296,11 +329,16 @@ impl<'a> StreamList<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Actions(Vec<Action>);
 
 impl Actions {
     fn from_poor(poor: &[PAction], proto: &DescriptorPool) -> Self {
         Actions(poor.iter().map(|p| Action::from_poor(p, proto)).collect())
+    }
+
+    fn gen_poor(&self) -> Vec<PAction> {
+        self.0.iter().map(|a| PAction::from_rich(a, self)).collect()
     }
 
     fn len(&self) -> usize {
@@ -371,17 +409,40 @@ impl Actions {
         self.get_mut().insert(i, message.into());
     }
 
-    fn stream_list(&mut self) -> StreamList {
-        StreamList::new(self.get_mut())
+    fn stream_list(&self) -> StreamList {
+        StreamList::new(self.get())
+    }
+
+    fn stream_list_mut(&mut self) -> StreamListMut {
+        StreamListMut::new(self.get_mut())
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Debug, Clone)]
 struct GrpcInput {
     #[serde(skip)]
     rich: OnceCell<Actions>,
 
     poor: Vec<PAction>,
+}
+
+impl Hash for GrpcInput {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.get_poor().hash(state);
+    }
+}
+
+impl serde::Serialize for GrpcInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("GrpcInput", 1)?;
+
+        serde::ser::SerializeStruct::serialize_field(&mut state, "poor", &self.get_poor())?;
+
+        serde::ser::SerializeStruct::end(state)
+    }
 }
 
 impl GrpcInput {
@@ -394,4 +455,14 @@ impl GrpcInput {
         let _ = self.rich(proto);
         self.rich.get_mut().unwrap()
     }
+
+    fn get_poor(&self) -> Vec<PAction> {
+        if let Some(rich) = self.rich.get() {
+            return rich.gen_poor();
+        };
+
+        self.poor.clone()
+    }
 }
+
+impl Input for GrpcInput {}

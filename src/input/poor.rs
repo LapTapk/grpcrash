@@ -94,19 +94,12 @@ pub enum PMessageConnection {
 }
 
 impl PMessageConnection {
-    fn from_rich(mc: &MessageConnection, actions: &Actions) -> Self {
+    fn from_rich(mc: &MessageConnection, streams: &HashMap<CallId, &Stream>) -> Self {
         match mc {
             MessageConnection::Stream(s_id) => Self::Stream(
                 PCallId::from_rich(s_id),
                 PCStream::from_rich(&CStream(
-                    actions
-                        .stream_list()
-                        .streams()
-                        .get(s_id)
-                        .expect("invalid id")
-                        .ty
-                        .method()
-                        .clone(),
+                    streams.get(s_id).expect("invalid id").ty.method().clone(),
                 )),
             ),
             MessageConnection::Unary(csu) => Self::Unary(PCSUnary::from_rich(csu)),
@@ -121,8 +114,8 @@ pub struct PMessage {
 }
 
 impl PMessage {
-    fn from_rich(m: &Message, actions: &Actions) -> Self {
-        let con = PMessageConnection::from_rich(&m.con, actions);
+    fn from_rich(m: &Message, streams: &HashMap<CallId, &Stream>) -> Self {
+        let con = PMessageConnection::from_rich(&m.con, streams);
         let payload = <DynamicMessage as prost::Message>::encode_to_vec(&m.payload);
 
         Self { con, payload }
@@ -137,10 +130,10 @@ pub enum PAction {
 }
 
 impl PAction {
-    pub fn from_rich(a: &Action, actions: &Actions) -> Self {
+    pub fn from_rich(a: &Action, streams: &HashMap<CallId, &Stream>) -> Self {
         match a {
             Action::Stream(sa) => Self::Stream(PStreamAction::from_rich(sa)),
-            Action::Message(m) => Self::Message(PMessage::from_rich(m, actions)),
+            Action::Message(m) => Self::Message(PMessage::from_rich(m, streams)),
             Action::Delay(d) => Self::Delay(*d),
         }
     }

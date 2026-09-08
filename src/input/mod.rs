@@ -55,16 +55,16 @@ impl CallId {
 struct CSUnary(MethodDescriptor);
 
 impl CSUnary {
-    fn new(md: MethodDescriptor) -> Self {
-        debug_assert!(
-            !(md.is_client_streaming() || md.is_server_streaming()),
-            "ClientStream can only contain method with client streaming"
-        );
-        Self(md)
+    fn new(md: MethodDescriptor) -> Result<Self, ActionError> {
+        if md.is_client_streaming() || md.is_server_streaming() {
+            return Err(ActionError::InvalidMethod);
+        }
+
+        Ok(Self(md))
     }
-    fn from_poor(pcsu: &PCSUnary, proto: &DescriptorPool) -> Self {
+    fn from_poor(pcsu: &PCSUnary, proto: &DescriptorPool) -> Result<Self, ActionError> {
         let name = &pcsu.0;
-        Self(get_method_by_full_name(name, proto).expect(&format!("No method named {}", name)))
+        Self::new(get_method_by_full_name(name, proto).ok_or(ActionError::ProtoMismatch)?)
     }
 }
 
@@ -72,17 +72,16 @@ impl CSUnary {
 struct CStream(MethodDescriptor);
 
 impl CStream {
-    fn new(md: MethodDescriptor) -> Self {
-        debug_assert!(
-            md.is_client_streaming(),
-            "ClientStream can only contain method with client streaming"
-        );
-        Self(md)
+    fn new(md: MethodDescriptor) -> Result<Self, ActionError> {
+        if !md.is_client_streaming() {
+            return Err(ActionError::InvalidMethod);
+        }
+        Ok(Self(md))
     }
 
-    fn from_poor(pcs: &PCStream, proto: &DescriptorPool) -> Self {
+    fn from_poor(pcs: &PCStream, proto: &DescriptorPool) -> Result<Self, ActionError> {
         let name = &pcs.0;
-        Self(get_method_by_full_name(name, proto).expect(&format!("No method named {}", name)))
+        Self::new(get_method_by_full_name(name, proto).ok_or(ActionError::ProtoMismatch)?)
     }
 }
 
@@ -93,23 +92,25 @@ struct SStream {
 }
 
 impl SStream {
-    fn new(md: MethodDescriptor, payload: DynamicMessage) -> Self {
-        debug_assert!(
-            md.is_server_streaming(),
-            "ServerStream can only contain method with server streaming"
-        );
-        debug_assert_eq!(md.input(), payload.descriptor());
+    fn new(md: MethodDescriptor, payload: DynamicMessage) -> Result<Self, ActionError> {
+        if !md.is_server_streaming() {
+            return Err(ActionError::InvalidMethod);
+        }
 
-        Self { md, payload }
+        if md.input() != payload.descriptor() {
+            return Err(ActionError::MessageCallDescriptorMismatch);
+        }
+
+        Ok(Self { md, payload })
     }
 
-    fn from_poor(pss: &PSStream, proto: &DescriptorPool) -> Self {
+    fn from_poor(pss: &PSStream, proto: &DescriptorPool) -> Result<Self, ActionError> {
         let name = &pss.md;
-        let md = get_method_by_full_name(name, proto).expect(&format!("No method named {}", name));
-        let payload =
-            DynamicMessage::decode(md.input(), pss.payload.as_slice()).expect("Invalid PSStream");
+        let md = get_method_by_full_name(name, proto).ok_or(ActionError::ProtoMismatch)?;
+        let payload = DynamicMessage::decode(md.input(), pss.payload.as_slice())
+            .map_err(|_| ActionError::ProtoMismatch)?;
 
-        Self { md, payload }
+        Self::new(md, payload)
     }
 }
 
@@ -120,11 +121,11 @@ enum StreamType {
 }
 
 impl StreamType {
-    fn from_poor(pst: &PStreamType, proto: &DescriptorPool) -> Self {
-        match pst {
-            PStreamType::Client(pcs) => Self::Client(CStream::from_poor(pcs, proto)),
-            PStreamType::Server(pss) => Self::Server(SStream::from_poor(pss, proto)),
-        }
+    fn from_poor(pst: &PStreamType, proto: &DescriptorPool) -> Result<Self, ActionError> {
+        Ok(match pst {
+            PStreamType::Client(pcs) => Self::Client(CStream::from_poor(pcs, proto)?),
+            PStreamType::Server(pss) => Self::Server(SStream::from_poor(pss, proto)?),
+        })
     }
 }
 
@@ -144,10 +145,10 @@ struct Stream {
 }
 
 impl Stream {
-    fn from_poor(ps: &PStream, proto: &DescriptorPool) -> Self {
-        let ty = StreamType::from_poor(&ps.ty, proto);
+    fn from_poor(ps: &PStream, proto: &DescriptorPool) -> Result<Self, ActionError> {
+        let ty = StreamType::from_poor(&ps.ty, proto)?;
         let id = CallId::from_poor(&ps.id);
-        Self { ty, id }
+        Ok(Self { ty, id })
     }
 }
 
@@ -164,11 +165,11 @@ enum StreamAction {
 }
 
 impl StreamAction {
-    fn from_poor(psa: &PStreamAction, proto: &DescriptorPool) -> Self {
-        match psa {
-            PStreamAction::StreamStart(ps) => Self::Start(Stream::from_poor(ps, proto)),
+    fn from_poor(psa: &PStreamAction, proto: &DescriptorPool) -> Result<Self, ActionError> {
+        Ok(match psa {
+            PStreamAction::StreamStart(ps) => Self::Start(Stream::from_poor(ps, proto)?),
             PStreamAction::StreamEnd(ps_id) => Self::End(CallId::from_poor(ps_id)),
-        }
+        })
     }
 }
 
@@ -197,21 +198,21 @@ impl Into<Action> for Message {
 }
 
 impl Message {
-    fn from_poor(pm: &PMessage, proto: &DescriptorPool) -> Self {
+    fn from_poor(pm: &PMessage, proto: &DescriptorPool) -> Result<Self, ActionError> {
         let (con, md) = match &pm.con {
             PMessageConnection::Stream(ps_id, pcs) => (
                 MessageConnection::Stream(CallId::from_poor(ps_id)),
-                CStream::from_poor(pcs, proto).0,
+                CStream::from_poor(pcs, proto)?.0,
             ),
             PMessageConnection::Unary(pcsu) => (
-                MessageConnection::Unary(CSUnary::from_poor(pcsu, proto)),
-                CSUnary::from_poor(pcsu, proto).0,
+                MessageConnection::Unary(CSUnary::from_poor(pcsu, proto)?),
+                CSUnary::from_poor(pcsu, proto)?.0,
             ),
         };
-        let payload =
-            DynamicMessage::decode(md.input(), pm.payload.as_slice()).expect("Incorrect PMessage");
+        let payload = DynamicMessage::decode(md.input(), pm.payload.as_slice())
+            .map_err(|_| ActionError::ProtoMismatch)?;
 
-        Self { con, payload }
+        Ok(Self { con, payload })
     }
 }
 
@@ -223,12 +224,12 @@ enum Action {
 }
 
 impl Action {
-    fn from_poor(pa: &PAction, proto: &DescriptorPool) -> Self {
-        match pa {
-            PAction::Stream(ps) => StreamAction::from_poor(ps, proto).into(),
-            PAction::Message(pm) => Message::from_poor(pm, proto).into(),
+    fn from_poor(pa: &PAction, proto: &DescriptorPool) -> Result<Self, ActionError> {
+        Ok(match pa {
+            PAction::Stream(ps) => StreamAction::from_poor(ps, proto)?.into(),
+            PAction::Message(pm) => Message::from_poor(pm, proto)?.into(),
             PAction::Delay(del) => Self::Delay(*del),
-        }
+        })
     }
 }
 
@@ -242,6 +243,41 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+enum ActionError {
+    InvalidMessageIdx,
+    InvalidStreamId,
+    InvalidStreamInterval,
+    StreamIsNotClient,
+    MessageCallDescriptorMismatch,
+    NoCallIdsLeft,
+    InvalidMethod,
+    ProtoMismatch,
+    DuplicateStreamEnd,
+}
+
+#[derive(Debug, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+struct ActionSequenceError {
+    kind: ActionError,
+    index: usize,
+}
+
+impl std::fmt::Display for ActionSequenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at action index {}", self.kind, self.index)
+    }
+}
+
+impl std::error::Error for ActionSequenceError {}
+
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for ActionError {}
+
 #[derive(Debug)]
 struct StreamMessageFactory<R> {
     si: StreamInterval,
@@ -252,19 +288,26 @@ impl<'a, R> StreamMessageFactory<R>
 where
     R: DerefMut<Target = Vec<Action>>,
 {
-    fn message(mut self, payload: DynamicMessage, i: usize) -> Option<()> {
-        let stream = get_stream(&self.actions, &self.si)?;
-        debug_assert!(matches!(stream.ty, StreamType::Client(_)));
-        debug_assert_eq!(stream.ty.method().input(), payload.descriptor());
-        debug_assert!(self.si.s < i);
-        debug_assert!(self.si.e >= i);
+    fn message(mut self, payload: DynamicMessage, i: usize) -> Result<(), ActionError> {
+        let stream =
+            get_stream(&self.actions, &self.si).ok_or(ActionError::InvalidStreamInterval)?;
+
+        if !matches!(stream.ty, StreamType::Client(_)) {
+            return Err(ActionError::StreamIsNotClient);
+        }
+        if stream.ty.method().input() != payload.descriptor() {
+            return Err(ActionError::MessageCallDescriptorMismatch);
+        }
+        if self.si.s >= i || self.si.e < i {
+            return Err(ActionError::InvalidMessageIdx);
+        }
 
         let message = Message {
             con: MessageConnection::Stream(stream.id),
             payload,
         };
         self.actions.insert(i, message.into());
-        Some(())
+        Ok(())
     }
 }
 
@@ -296,7 +339,7 @@ impl<R> StreamsView<R>
 where
     R: Deref<Target = Vec<Action>>,
 {
-    fn new(actions: R) -> Self {
+    fn new(actions: R) -> Result<Self, ActionSequenceError> {
         let mut streams_idxs: HashMap<CallId, (usize, Option<usize>)> = HashMap::new();
 
         for (i, a) in actions.iter().enumerate() {
@@ -310,7 +353,12 @@ where
                         .expect("Actions has ending for unstarted stream")
                         .1
                         .replace(i);
-                    debug_assert_eq!(old_end, None);
+                    if !old_end.is_none() {
+                        return Err(ActionSequenceError {
+                            kind: ActionError::DuplicateStreamEnd,
+                            index: i,
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -329,7 +377,7 @@ where
             })
             .collect();
 
-        Self { actions, intervals }
+        Ok(Self { actions, intervals })
     }
 
     fn intervals(&self) -> &HashMap<CallId, StreamInterval> {
@@ -350,31 +398,38 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct Actions {
+struct ActionSequence {
     actions: Vec<Action>,
     last_call_id: CallId,
 }
 
-impl Actions {
-    fn from_poor(poor: &[PAction], proto: &DescriptorPool) -> Self {
-        let actions = poor.iter().map(|p| Action::from_poor(p, proto)).collect();
-        let last_call_id = *StreamsView::new(&actions)
+impl ActionSequence {
+    fn from_poor(poor: &[PAction], proto: &DescriptorPool) -> Result<Self, ActionSequenceError> {
+        let actions: Vec<Action> = poor
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                Action::from_poor(p, proto).map_err(|e| ActionSequenceError { kind: e, index: i })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let last_call_id = *StreamsView::new(&actions)?
             .intervals()
             .keys()
             .max()
             .unwrap_or(&CallId(0));
 
-        Actions {
+        Ok(ActionSequence {
             actions,
             last_call_id,
-        }
+        })
     }
 
-    fn gen_poor(&self) -> Vec<PAction> {
+    fn gen_poor(&self) -> Result<Vec<PAction>, ActionSequenceError> {
         self.actions
             .iter()
-            .map(|a| PAction::from_rich(a, self))
-            .collect()
+            .map(|a| Ok(PAction::from_rich(a, &self.stream_list()?.streams())))
+            .collect::<Result<Vec<_>, _>>()
     }
 
     fn len(&self) -> usize {
@@ -401,10 +456,10 @@ impl Actions {
         id: CallId,
         start: usize,
         end: usize,
-    ) -> Option<()> {
-        debug_assert!(start < self.len(), "start {} >= len {}", start, self.len());
-        debug_assert!(end < self.len(), "end {} >= len {}", end, self.len());
-        debug_assert!(start < end, "start {} >= end {}", start, end);
+    ) -> Result<(), ActionError> {
+        if start >= self.len() || end >= self.len() || start >= end {
+            return Err(ActionError::InvalidStreamInterval);
+        }
 
         let end_action: Action = CallId::from(id).into();
 
@@ -412,7 +467,7 @@ impl Actions {
         actions.reserve(2);
         actions.insert(end, end_action);
         actions.insert(start, start_action);
-        Some(())
+        Ok(())
     }
 
     fn add_server_stream(
@@ -421,38 +476,53 @@ impl Actions {
         payload: DynamicMessage,
         start: usize,
         end: usize,
-    ) -> Option<()> {
-        let ty = StreamType::Server(SStream::new(md, payload));
-        let id = self.allocate_call_id()?;
+    ) -> Result<(), ActionError> {
+        let ty = StreamType::Server(SStream::new(md, payload)?);
+        let id = self.allocate_call_id().ok_or(ActionError::NoCallIdsLeft)?;
         let stream = Stream { ty, id };
         let start_action: Action = stream.into();
         self.add_stream(start_action, id, start, end)
     }
 
-    fn add_client_stream(&mut self, md: MethodDescriptor, start: usize, end: usize) -> Option<()> {
-        let ty = StreamType::Client(CStream::new(md)).into();
-        let id = self.allocate_call_id()?;
+    fn add_client_stream(
+        &mut self,
+        md: MethodDescriptor,
+        start: usize,
+        end: usize,
+    ) -> Result<(), ActionError> {
+        let ty = StreamType::Client(CStream::new(md)?).into();
+        let id = self.allocate_call_id().ok_or(ActionError::NoCallIdsLeft)?;
         let stream = Stream { ty, id };
         let start_action: Action = stream.into();
         self.add_stream(start_action, id, start, end)
     }
 
-    fn add_unary(&mut self, md: CSUnary, payload: DynamicMessage, i: usize) {
-        debug_assert_eq!(md.0.input(), payload.descriptor());
-        debug_assert!(i < self.len(), "i {} < len {}", i, self.len());
+    fn add_unary(
+        &mut self,
+        md: CSUnary,
+        payload: DynamicMessage,
+        i: usize,
+    ) -> Result<(), ActionError> {
+        if md.0.input() != payload.descriptor() {
+            return Err(ActionError::MessageCallDescriptorMismatch);
+        }
+        if i >= self.len() {
+            return Err(ActionError::InvalidMessageIdx);
+        }
 
         let message = Message {
             con: MessageConnection::Unary(md),
             payload,
         };
         self.get_mut().insert(i, message.into());
+        Ok(())
     }
 
-    fn stream_list(&self) -> StreamsView<&Vec<Action>> {
+    fn stream_list(&self) -> Result<StreamsView<&Vec<Action>>, ActionSequenceError> {
         StreamsView::new(self.get())
     }
 
-    fn stream_list_mut(&mut self) -> StreamsView<&mut Vec<Action>> {
+    fn stream_list_mut(&mut self) -> Result<StreamsView<&mut Vec<Action>>, ActionSequenceError> {
         StreamsView::new(self.get_mut())
     }
 }
@@ -460,14 +530,16 @@ impl Actions {
 #[derive(serde::Deserialize, Debug, Clone)]
 struct GrpcInput {
     #[serde(skip)]
-    rich: OnceCell<Actions>,
+    rich: OnceCell<ActionSequence>,
 
     poor: Vec<PAction>,
 }
 
 impl Hash for GrpcInput {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.get_poor().hash(state);
+        self.get_poor()
+            .expect("Trying to compute hash of invalid GrpcInput")
+            .hash(state);
     }
 }
 
@@ -476,31 +548,40 @@ impl serde::Serialize for GrpcInput {
     where
         S: serde::Serializer,
     {
+        use serde::ser::Error as _;
+
         let mut state = serializer.serialize_struct("GrpcInput", 1)?;
 
-        serde::ser::SerializeStruct::serialize_field(&mut state, "poor", &self.get_poor())?;
+        let poor = self
+            .get_poor()
+            .map_err(|e| S::Error::custom(e.to_string()))?;
+
+        serde::ser::SerializeStruct::serialize_field(&mut state, "poor", &poor)?;
 
         serde::ser::SerializeStruct::end(state)
     }
 }
 
 impl GrpcInput {
-    fn rich(&self, proto: &DescriptorPool) -> &Actions {
+    fn rich(&self, proto: &DescriptorPool) -> Result<&ActionSequence, ActionSequenceError> {
         self.rich
-            .get_or_init(|| Actions::from_poor(self.poor.as_slice(), proto))
+            .get_or_try_init(|| ActionSequence::from_poor(self.poor.as_slice(), proto))
     }
 
-    fn rich_mut(&mut self, proto: &DescriptorPool) -> &mut Actions {
-        let _ = self.rich(proto);
-        self.rich.get_mut().unwrap()
+    fn rich_mut(
+        &mut self,
+        proto: &DescriptorPool,
+    ) -> Result<&mut ActionSequence, ActionSequenceError> {
+        let _ = self.rich(proto)?;
+        Ok(self.rich.get_mut().unwrap())
     }
 
-    fn get_poor(&self) -> Vec<PAction> {
+    fn get_poor(&self) -> Result<Vec<PAction>, ActionSequenceError> {
         if let Some(rich) = self.rich.get() {
             return rich.gen_poor();
         };
 
-        self.poor.clone()
+        Ok(self.poor.clone())
     }
 }
 

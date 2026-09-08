@@ -4,7 +4,11 @@ use libafl::inputs::Input;
 use once_cell::sync::OnceCell;
 use poor::*;
 use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor, ReflectMessage};
-use std::hash::{Hash, Hasher};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    ops::{Deref, DerefMut},
+};
 
 fn get_method_by_full_name(
     full_name: &str,
@@ -20,29 +24,29 @@ fn get_method_by_full_name(
 }
 
 // TODO: get rid of this struct
-#[derive(Copy, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct StreamId(usize);
+#[derive(Copy, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CallId(usize);
 
-impl Into<Action> for StreamId {
+impl Into<Action> for CallId {
     fn into(self) -> Action {
-        Action::Stream(StreamAction::StreamEnd(self))
+        Action::Stream(StreamAction::End(self))
     }
 }
 
-impl From<usize> for StreamId {
+impl From<usize> for CallId {
     fn from(value: usize) -> Self {
-        StreamId(value)
+        CallId(value)
     }
 }
 
-impl Into<usize> for StreamId {
+impl Into<usize> for CallId {
     fn into(self) -> usize {
         self.0
     }
 }
 
-impl StreamId {
-    fn from_poor(ps_id: &PStreamId) -> Self {
+impl CallId {
+    fn from_poor(ps_id: &PCallId) -> Self {
         Self(ps_id.0)
     }
 }
@@ -110,21 +114,21 @@ impl SStream {
 }
 
 #[derive(Debug, Clone)]
-enum Stream {
+enum StreamType {
     Client(CStream),
     Server(SStream),
 }
 
-impl Stream {
-    fn from_poor(ps: &PStream, proto: &DescriptorPool) -> Self {
-        match ps {
-            PStream::Client(pcs) => Self::Client(CStream::from_poor(pcs, proto)),
-            PStream::Server(pss) => Self::Server(SStream::from_poor(pss, proto)),
+impl StreamType {
+    fn from_poor(pst: &PStreamType, proto: &DescriptorPool) -> Self {
+        match pst {
+            PStreamType::Client(pcs) => Self::Client(CStream::from_poor(pcs, proto)),
+            PStreamType::Server(pss) => Self::Server(SStream::from_poor(pss, proto)),
         }
     }
 }
 
-impl Stream {
+impl StreamType {
     fn method(&self) -> &MethodDescriptor {
         match self {
             Self::Client(s) => &s.0,
@@ -133,24 +137,37 @@ impl Stream {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Stream {
+    ty: StreamType,
+    id: CallId,
+}
+
+impl Stream {
+    fn from_poor(ps: &PStream, proto: &DescriptorPool) -> Self {
+        let ty = StreamType::from_poor(&ps.ty, proto);
+        let id = CallId::from_poor(&ps.id);
+        Self { ty, id }
+    }
+}
+
 impl Into<Action> for Stream {
     fn into(self) -> Action {
-        Action::Stream(StreamAction::StreamStart(self))
+        Action::Stream(StreamAction::Start(self))
     }
 }
 
 #[derive(Debug, Clone)]
 enum StreamAction {
-    // TODO: Remove Stream prefix
-    StreamStart(Stream),
-    StreamEnd(StreamId),
+    Start(Stream),
+    End(CallId),
 }
 
 impl StreamAction {
     fn from_poor(psa: &PStreamAction, proto: &DescriptorPool) -> Self {
         match psa {
-            PStreamAction::StreamStart(ps) => Self::StreamStart(Stream::from_poor(ps, proto)),
-            PStreamAction::StreamEnd(ps_id) => Self::StreamEnd(StreamId::from_poor(ps_id)),
+            PStreamAction::StreamStart(ps) => Self::Start(Stream::from_poor(ps, proto)),
+            PStreamAction::StreamEnd(ps_id) => Self::End(CallId::from_poor(ps_id)),
         }
     }
 }
@@ -162,13 +179,8 @@ impl Into<Action> for StreamAction {
 }
 
 #[derive(Debug, Clone)]
-struct StreamMessage {
-    stream_id: StreamId,
-}
-
-#[derive(Debug, Clone)]
 enum MessageConnection {
-    Stream(StreamId),
+    Stream(CallId),
     Unary(CSUnary),
 }
 
@@ -188,7 +200,7 @@ impl Message {
     fn from_poor(pm: &PMessage, proto: &DescriptorPool) -> Self {
         let (con, md) = match &pm.con {
             PMessageConnection::Stream(ps_id, pcs) => (
-                MessageConnection::Stream(StreamId::from_poor(ps_id)),
+                MessageConnection::Stream(CallId::from_poor(ps_id)),
                 CStream::from_poor(pcs, proto).0,
             ),
             PMessageConnection::Unary(pcsu) => (
@@ -220,174 +232,187 @@ impl Action {
     }
 }
 
-#[derive(Clone, Debug, Copy)]
+fn get_stream<'a, R>(actions: &'a R, si: &'a StreamInterval) -> Option<&'a Stream>
+where
+    R: Deref<Target = Vec<Action>>,
+{
+    match &actions[si.s] {
+        Action::Stream(StreamAction::Start(s)) => Some(s),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct StreamMessageFactory<R> {
+    si: StreamInterval,
+    actions: R,
+}
+
+impl<'a, R> StreamMessageFactory<R>
+where
+    R: DerefMut<Target = Vec<Action>>,
+{
+    fn message(mut self, payload: DynamicMessage, i: usize) -> Option<()> {
+        let stream = get_stream(&self.actions, &self.si)?;
+        debug_assert!(matches!(stream.ty, StreamType::Client(_)));
+        debug_assert_eq!(stream.ty.method().input(), payload.descriptor());
+        debug_assert!(self.si.s < i);
+        debug_assert!(self.si.e >= i);
+
+        let message = Message {
+            con: MessageConnection::Stream(stream.id),
+            payload,
+        };
+        self.actions.insert(i, message.into());
+        Some(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct StreamInterval {
     s: usize,
     e: usize,
 }
 
-impl StreamInterval {
-    fn stream<'a>(&self, actions: &'a [Action]) -> &'a Stream {
-        match &actions[self.s] {
-            Action::Stream(StreamAction::StreamStart(stream)) => stream,
-            _ => unreachable!(),
-        }
-    }
+#[derive(Debug)]
+struct StreamsView<R> {
+    intervals: HashMap<CallId, StreamInterval>,
+    actions: R,
 }
 
-#[derive(Debug, Clone)]
-struct StreamList<'a> {
-    streams: Vec<StreamInterval>,
-    actions: &'a Vec<Action>,
-}
-
-fn get_streams(actions: &Vec<Action>) -> Vec<StreamInterval> {
-    let mut stream_starts: Vec<usize> = Vec::new();
-    let mut stream_ends: Vec<Option<usize>> = Vec::new();
-
-    for (i, a) in actions.iter().enumerate() {
-        match a {
-            Action::Stream(StreamAction::StreamStart(_)) => {
-                stream_starts.push(i);
-            }
-            Action::Stream(StreamAction::StreamEnd(s_id)) => {
-                stream_ends.resize_with(stream_starts.len(), || None);
-                let s_id_usize: usize = (*s_id).into();
-                let old_end = stream_ends[s_id_usize].replace(i);
-                debug_assert_eq!(old_end, None);
-            }
-            _ => {}
-        }
-    }
-
-    stream_starts
-        .into_iter()
-        .zip(stream_ends)
-        .map(|(s, e)| StreamInterval {
-            s,
-            e: e.expect("Not all streams have an end. GrpcInput is broken"),
+impl<R> StreamsView<R>
+where
+    R: DerefMut<Target = Vec<Action>>,
+{
+    fn into_message_factory(self, id: &CallId) -> Option<StreamMessageFactory<R>> {
+        Some(StreamMessageFactory {
+            si: *self.intervals.get(id)?,
+            actions: self.actions,
         })
-        .collect()
+    }
 }
 
-impl<'a> StreamList<'a> {
-    fn new(actions: &'a Vec<Action>) -> Self {
-        let streams = get_streams(actions);
-        Self { actions, streams }
-    }
+impl<R> StreamsView<R>
+where
+    R: Deref<Target = Vec<Action>>,
+{
+    fn new(actions: R) -> Self {
+        let mut streams_idxs: HashMap<CallId, (usize, Option<usize>)> = HashMap::new();
 
-    fn stream(&self, s_id: StreamId) -> &Stream {
-        let s_id_idx: usize = s_id.into();
-        let si = self.streams[s_id_idx];
-        si.stream(self.actions)
-    }
+        for (i, a) in actions.iter().enumerate() {
+            match a {
+                Action::Stream(StreamAction::Start(s)) => {
+                    streams_idxs.insert(s.id, (i, None));
+                }
+                Action::Stream(StreamAction::End(s_id)) => {
+                    let old_end = streams_idxs
+                        .get_mut(s_id)
+                        .expect("Actions has ending for unstarted stream")
+                        .1
+                        .replace(i);
+                    debug_assert_eq!(old_end, None);
+                }
+                _ => {}
+            }
+        }
 
-    fn client_streams(&self) -> Vec<StreamId> {
-        self.streams
+        let intervals = streams_idxs
             .iter()
-            .enumerate()
-            .filter(|(_, si)| matches!(si.stream(self.actions), Stream::Client(_)))
-            .map(|(s_id, _)| s_id.into())
+            .map(|(id, (s, e))| {
+                (
+                    *id,
+                    StreamInterval {
+                        s: *s,
+                        e: e.expect(&format!("Stream {:?} does not have an end action", id)),
+                    },
+                )
+            })
+            .collect();
+
+        Self { actions, intervals }
+    }
+
+    fn intervals(&self) -> &HashMap<CallId, StreamInterval> {
+        &self.intervals
+    }
+
+    fn streams(&self) -> HashMap<CallId, &Stream> {
+        self.intervals
+            .iter()
+            .map(|(id, si)| {
+                (
+                    *id,
+                    get_stream(&self.actions, si).expect("invalid stream interval"),
+                )
+            })
             .collect()
     }
 }
 
-#[derive(Debug)]
-struct StreamListMut<'a> {
-    streams: Vec<StreamInterval>,
-    actions: &'a mut Vec<Action>,
-}
-
-impl<'a> StreamListMut<'a> {
-    fn new(actions: &'a mut Vec<Action>) -> Self {
-        let streams = get_streams(actions);
-        Self { actions, streams }
-    }
-
-    fn immut(&self) -> StreamList {
-        StreamList::new(self.actions)
-    }
-
-    fn message(self, s_id: StreamId, payload: DynamicMessage, i: usize) {
-        let immut = &self.immut();
-        let stream = immut.stream(s_id);
-
-        debug_assert!(matches!(stream, Stream::Client(_)));
-        debug_assert_eq!(stream.method().input(), payload.descriptor());
-
-        let s_id_idx: usize = s_id.into();
-        let si = self.streams[s_id_idx];
-
-        debug_assert!(si.s < i);
-        debug_assert!(si.e >= i);
-
-        let message = Message {
-            con: MessageConnection::Stream(s_id),
-            payload,
-        };
-        self.actions.insert(i, message.into());
-    }
-}
-
-fn inc_s_id(s_id: &mut StreamId, cnt: usize) {
-    let s_id_usize: usize = (*s_id).into();
-    if s_id_usize >= cnt {
-        *s_id = StreamId::from(s_id_usize + 1)
-    }
-}
-
 #[derive(Debug, Clone)]
-struct Actions(Vec<Action>);
+struct Actions {
+    actions: Vec<Action>,
+    last_call_id: CallId,
+}
 
 impl Actions {
     fn from_poor(poor: &[PAction], proto: &DescriptorPool) -> Self {
-        Actions(poor.iter().map(|p| Action::from_poor(p, proto)).collect())
+        let actions = poor.iter().map(|p| Action::from_poor(p, proto)).collect();
+        let last_call_id = *StreamsView::new(&actions)
+            .intervals()
+            .keys()
+            .max()
+            .unwrap_or(&CallId(0));
+
+        Actions {
+            actions,
+            last_call_id,
+        }
     }
 
     fn gen_poor(&self) -> Vec<PAction> {
-        self.0.iter().map(|a| PAction::from_rich(a, self)).collect()
+        self.actions
+            .iter()
+            .map(|a| PAction::from_rich(a, self))
+            .collect()
     }
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.actions.len()
     }
 
     fn get(&self) -> &Vec<Action> {
-        &self.0
+        &self.actions
     }
 
     fn get_mut(&mut self) -> &mut Vec<Action> {
-        &mut self.0
+        &mut self.actions
     }
 
-    fn add_stream(&mut self, start_action: Action, start: usize, end: usize) {
+    fn allocate_call_id(&mut self) -> Option<CallId> {
+        let next_call_id = self.last_call_id.0.checked_add(1)?;
+        self.last_call_id = CallId(next_call_id);
+        Some(self.last_call_id)
+    }
+
+    fn add_stream(
+        &mut self,
+        start_action: Action,
+        id: CallId,
+        start: usize,
+        end: usize,
+    ) -> Option<()> {
         debug_assert!(start < self.len(), "start {} >= len {}", start, self.len());
         debug_assert!(end < self.len(), "end {} >= len {}", end, self.len());
         debug_assert!(start < end, "start {} >= end {}", start, end);
 
-        let cnt = self
-            .get()
-            .iter()
-            .take(start)
-            .filter(|action| matches!(action, Action::Stream(StreamAction::StreamStart(_))))
-            .count();
-
-        for a in self.get_mut().iter_mut().skip(start) {
-            if let Action::Stream(StreamAction::StreamEnd(s_id)) = a {
-                inc_s_id(s_id, cnt);
-            } else if let Action::Message(m) = a
-                && let MessageConnection::Stream(s_id) = &mut m.con
-            {
-                inc_s_id(s_id, cnt);
-            }
-        }
-
-        let end_action: Action = StreamId::from(cnt).into();
+        let end_action: Action = CallId::from(id).into();
 
         let actions = self.get_mut();
         actions.reserve(2);
         actions.insert(end, end_action);
         actions.insert(start, start_action);
+        Some(())
     }
 
     fn add_server_stream(
@@ -396,14 +421,20 @@ impl Actions {
         payload: DynamicMessage,
         start: usize,
         end: usize,
-    ) {
-        let start_action: Action = Stream::Server(SStream::new(md, payload)).into();
-        self.add_stream(start_action, start, end);
+    ) -> Option<()> {
+        let ty = StreamType::Server(SStream::new(md, payload));
+        let id = self.allocate_call_id()?;
+        let stream = Stream { ty, id };
+        let start_action: Action = stream.into();
+        self.add_stream(start_action, id, start, end)
     }
 
-    fn add_client_stream(&mut self, md: MethodDescriptor, start: usize, end: usize) {
-        let start_action: Action = Stream::Client(CStream::new(md)).into();
-        self.add_stream(start_action, start, end);
+    fn add_client_stream(&mut self, md: MethodDescriptor, start: usize, end: usize) -> Option<()> {
+        let ty = StreamType::Client(CStream::new(md)).into();
+        let id = self.allocate_call_id()?;
+        let stream = Stream { ty, id };
+        let start_action: Action = stream.into();
+        self.add_stream(start_action, id, start, end)
     }
 
     fn add_unary(&mut self, md: CSUnary, payload: DynamicMessage, i: usize) {
@@ -417,12 +448,12 @@ impl Actions {
         self.get_mut().insert(i, message.into());
     }
 
-    fn stream_list(&self) -> StreamList {
-        StreamList::new(self.get())
+    fn stream_list(&self) -> StreamsView<&Vec<Action>> {
+        StreamsView::new(self.get())
     }
 
-    fn stream_list_mut(&mut self) -> StreamListMut {
-        StreamListMut::new(self.get_mut())
+    fn stream_list_mut(&mut self) -> StreamsView<&mut Vec<Action>> {
+        StreamsView::new(self.get_mut())
     }
 }
 

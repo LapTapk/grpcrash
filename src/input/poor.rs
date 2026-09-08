@@ -2,10 +2,10 @@ use super::*;
 use prost_reflect::DynamicMessage;
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Hash)]
-pub struct PStreamId(pub usize);
+pub struct PCallId(pub usize);
 
-impl PStreamId {
-    fn from_rich(s_id: &StreamId) -> Self {
+impl PCallId {
+    fn from_rich(s_id: &CallId) -> Self {
         Self(s_id.0)
     }
 }
@@ -44,38 +44,52 @@ impl PSStream {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Hash)]
-pub enum PStream {
+pub enum PStreamType {
     Client(PCStream),
     Server(PSStream),
 }
 
+impl PStreamType {
+    fn from_rich(s: &StreamType) -> Self {
+        match s {
+            StreamType::Client(cs) => Self::Client(PCStream::from_rich(cs)),
+            StreamType::Server(ss) => Self::Server(PSStream::from_rich(ss)),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Hash)]
+pub struct PStream {
+    pub ty: PStreamType,
+    pub id: PCallId,
+}
+
 impl PStream {
     fn from_rich(s: &Stream) -> Self {
-        match s {
-            Stream::Client(cs) => Self::Client(PCStream::from_rich(cs)),
-            Stream::Server(ss) => Self::Server(PSStream::from_rich(ss)),
-        }
+        let ty = PStreamType::from_rich(&s.ty);
+        let id = PCallId::from_rich(&s.id);
+        Self { ty, id }
     }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Hash)]
 pub enum PStreamAction {
     StreamStart(PStream),
-    StreamEnd(PStreamId),
+    StreamEnd(PCallId),
 }
 
 impl PStreamAction {
     fn from_rich(sa: &StreamAction) -> Self {
         match sa {
-            StreamAction::StreamStart(s) => Self::StreamStart(PStream::from_rich(s)),
-            StreamAction::StreamEnd(s_id) => Self::StreamEnd(PStreamId::from_rich(s_id)),
+            StreamAction::Start(s) => Self::StreamStart(PStream::from_rich(s)),
+            StreamAction::End(s_id) => Self::StreamEnd(PCallId::from_rich(s_id)),
         }
     }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Hash)]
 pub enum PMessageConnection {
-    Stream(PStreamId, PCStream),
+    Stream(PCallId, PCStream),
     Unary(PCSUnary),
 }
 
@@ -83,9 +97,16 @@ impl PMessageConnection {
     fn from_rich(mc: &MessageConnection, actions: &Actions) -> Self {
         match mc {
             MessageConnection::Stream(s_id) => Self::Stream(
-                PStreamId::from_rich(s_id),
+                PCallId::from_rich(s_id),
                 PCStream::from_rich(&CStream(
-                    actions.stream_list().stream(*s_id).method().clone(),
+                    actions
+                        .stream_list()
+                        .streams()
+                        .get(s_id)
+                        .expect("invalid id")
+                        .ty
+                        .method()
+                        .clone(),
                 )),
             ),
             MessageConnection::Unary(csu) => Self::Unary(PCSUnary::from_rich(csu)),

@@ -266,8 +266,8 @@ impl ActionSequence {
 
         let actions = self.get_mut();
         actions.reserve(2);
-        actions.insert(end, id.into());
         actions.insert(start, start_action);
+        actions.insert(end, id.into());
         Ok(())
     }
 
@@ -331,8 +331,10 @@ impl ActionSequence {
 
     pub(super) fn stream_list_mut(
         &mut self,
-    ) -> Result<StreamsView<&Vec<Action>, impl Borrow<StreamIntervalIndex> + '_>, ActionSequenceError>
-    {
+    ) -> Result<
+        StreamsView<&mut Vec<Action>, impl Borrow<StreamIntervalIndex> + '_>,
+        ActionSequenceError,
+    > {
         let index = match self.cached_index.take() {
             Some(index) => index,
             None => calc_index(&self.actions)?,

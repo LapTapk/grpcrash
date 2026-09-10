@@ -332,7 +332,7 @@ impl ActionSequence {
         Ok(())
     }
 
-    fn stream_list(
+    pub(super) fn stream_list(
         &self,
     ) -> Result<StreamsView<&Vec<Action>, impl Borrow<StreamIntervalIndex> + '_>, ActionSequenceError>
     {

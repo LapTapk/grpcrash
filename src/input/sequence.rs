@@ -174,11 +174,10 @@ where
     }
 }
 
-//TODO: make field private
 #[derive(Debug, Clone)]
 pub(super) struct ActionSequence {
-    pub(super) actions: Vec<Action>,
-    pub(super) last_call_id: CallId,
+    actions: Vec<Action>,
+    last_call_id: CallId,
     cached_index: Option<StreamIntervalIndex>,
 }
 
@@ -240,8 +239,7 @@ impl ActionSequence {
         self.cached_index.take()
     }
 
-    //TODO: make private
-    pub(super) fn get_mut(&mut self) -> &mut Vec<Action> {
+    fn get_mut(&mut self) -> &mut Vec<Action> {
         self.invalidate_index();
         &mut self.actions
     }

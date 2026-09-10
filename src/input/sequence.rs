@@ -13,8 +13,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-//TODO: rename to get_stream_start
-fn get_stream<'a, R>(actions: &'a R, interval: &StreamInterval) -> Option<&'a Stream>
+fn get_stream_start<'a, R>(actions: &'a R, interval: &StreamInterval) -> Option<&'a Stream>
 where
     R: Deref<Target = Vec<Action>>,
 {
@@ -39,8 +38,8 @@ where
         payload: DynamicMessage,
         index: usize,
     ) -> Result<(), ActionError> {
-        let stream =
-            get_stream(&self.actions, &self.interval).ok_or(ActionError::InvalidStreamInterval)?;
+        let stream = get_stream_start(&self.actions, &self.interval)
+            .ok_or(ActionError::InvalidStreamInterval)?;
 
         if !matches!(stream.ty, StreamType::Client(_)) {
             return Err(ActionError::StreamIsNotClient);
@@ -168,7 +167,7 @@ where
             .borrow()
             .iter()
             .filter_map(|(id, interval)| {
-                get_stream(&self.actions, interval).map(|stream| (*id, stream))
+                get_stream_start(&self.actions, interval).map(|stream| (*id, stream))
             })
             .collect()
     }

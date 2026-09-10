@@ -256,7 +256,11 @@ impl ActionSequence {
         start: usize,
         end: usize,
     ) -> Result<(), ActionError> {
-        if start >= self.len() || end >= self.len() || start >= end {
+        if start > self.len()
+            || (start == self.len() && end > self.len() + 1)
+            || (start < self.len() && end > self.len())
+            || start >= end
+        {
             return Err(ActionError::InvalidStreamInterval);
         }
 
@@ -299,7 +303,7 @@ impl ActionSequence {
         if md.0.input() != payload.descriptor() {
             return Err(ActionError::MessageCallDescriptorMismatch);
         }
-        if index >= self.len() {
+        if index > self.len() {
             return Err(ActionError::InvalidMessageIdx);
         }
 

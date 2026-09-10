@@ -249,6 +249,12 @@ impl ActionSequence {
         Some(self.last_call_id)
     }
 
+    fn deallocate_call_id(&mut self) -> Option<CallId> {
+        let next_call_id = self.last_call_id.0.checked_sub(1)?;
+        self.last_call_id = CallId(next_call_id);
+        Some(self.last_call_id)
+    }
+
     fn add_stream(
         &mut self,
         start_action: Action,
@@ -280,7 +286,11 @@ impl ActionSequence {
     ) -> Result<(), ActionError> {
         let ty = StreamType::Server(SStream::new(md, payload)?);
         let id = self.allocate_call_id().ok_or(ActionError::NoCallIdsLeft)?;
-        self.add_stream(Stream { ty, id }.into(), id, start, end)
+        let res = self.add_stream(Stream { ty, id }.into(), id, start, end);
+        if res.is_err() {
+            self.deallocate_call_id();
+        }
+        res
     }
 
     pub(super) fn add_client_stream(
@@ -291,7 +301,11 @@ impl ActionSequence {
     ) -> Result<(), ActionError> {
         let ty = StreamType::Client(CStream::new(md)?);
         let id = self.allocate_call_id().ok_or(ActionError::NoCallIdsLeft)?;
-        self.add_stream(Stream { ty, id }.into(), id, start, end)
+        let res = self.add_stream(Stream { ty, id }.into(), id, start, end);
+        if res.is_err() {
+            self.deallocate_call_id();
+        }
+        res
     }
 
     pub(super) fn add_unary(
